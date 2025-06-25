@@ -1,0 +1,308 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ECS Cluster and Service for Image Application'
+
+Parameters:
+  EnvironmentName:
+    Description: 'An environment name that is prefixed to resource names'
+    Type: String
+    Default: 'ImageApp'
+  
+  ECRRepositoryName:
+    Description: 'Name of the ECR repository'
+    Type: String
+    Default: 'springboot-image-app'
+  
+  ImageTag:
+    Description: 'Tag of the Docker image to deploy'
+    Type: String
+    Default: 'latest'
+  
+  DesiredCount:
+    Description: 'Number of tasks to run'
+    Type: Number
+    Default: 2
+  
+  ContainerPort:
+    Description: 'Port that the container listens on'
+    Type: Number
+    Default: 8000
+  
+  HostPort:
+    Description: 'Port that the host listens on'
+    Type: Number
+    Default: 8000
+  
+  ContainerMemory:
+    Description: 'Memory to allocate to the container (MB)'
+    Type: Number
+    Default: 512
+  
+  ContainerCPU:
+    Description: 'CPU units to allocate to the container (1 vCPU = 1024)'
+    Type: Number
+    Default: 256
+
+Resources:
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${EnvironmentName}-Cluster
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+          Base: 1
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${EnvironmentName}-ALB
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups:
+        - !ImportValue
+          !Sub ${EnvironmentName}-ALBSecurityGroupId
+      Subnets:
+        - !ImportValue
+          !Sub ${EnvironmentName}-PublicSubnet1Id
+        - !ImportValue
+          !Sub ${EnvironmentName}-PublicSubnet2Id
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${EnvironmentName}-TG
+      Port: 80
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !ImportValue
+        !Sub ${EnvironmentName}-VPCId
+      HealthCheckPath: /actuator/health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: '200'
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: !Sub ${EnvironmentName}-ECSTaskExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource: '*'
+
+  ECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub ${EnvironmentName}-Service
+      Cluster: !Ref ECSCluster
+      LaunchType: FARGATE
+      DeploymentController:
+        Type: CODE_DEPLOY
+      DesiredCount: !Ref DesiredCount
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !ImportValue
+              !Sub ${EnvironmentName}-ECSSecurityGroupId
+          Subnets:
+            - !ImportValue
+              !Sub ${EnvironmentName}-PrivateSubnet1Id
+            - !ImportValue
+              !Sub ${EnvironmentName}-PrivateSubnet2Id
+      LoadBalancers:
+        - ContainerName: !Sub ${EnvironmentName}-Container
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref ALBTargetGroup
+      TaskDefinition: !Ref ECSTaskDefinition
+
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${EnvironmentName}-Task
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      Cpu: !Ref ContainerCPU
+      Memory: !Ref ContainerMemory
+      ContainerDefinitions:
+        - Name: !Sub ${EnvironmentName}-Container
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepositoryName}:${ImageTag}
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              HostPort: !Ref HostPort
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CloudWatchLogsGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Environment:
+            - Name: SPRING_PROFILES_ACTIVE
+              Value: production
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+
+  CloudWatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${EnvironmentName}-Task
+      RetentionInDays: 7
+
+  ECSServiceAutoScaling:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: 4
+      MinCapacity: 2
+      ResourceId: !Sub service/${ECSCluster}/${ECSService}
+      RoleARN: !GetAtt AutoScalingRole.Arn
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  AutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: application-autoscaling.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: service-autoscaling
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - application-autoscaling:*
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:PutMetricAlarm
+                  - ecs:DescribeServices
+                  - ecs:UpdateService
+                Resource: '*'
+
+  CPUUtilizationAlarmHigh:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: 'Alarm if CPU too high or metric disappears indicating instance is down'
+      Namespace: 'AWS/ECS'
+      MetricName: 'CPUUtilization'
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ECSCluster
+        - Name: ServiceName
+          Value: !GetAtt ECSService.Name
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 50
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref ECSServiceScalingPolicy
+
+  ECSServiceScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${EnvironmentName}-ScaleOutPolicy
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ECSServiceAutoScaling
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 50.0
+        ScaleInCooldown: 60
+        ScaleOutCooldown: 60
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${EnvironmentName}-images-${AWS::AccountId}
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanUpIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt ECSTaskExecutionRole.Arn
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt S3Bucket.Arn
+              - !Sub ${S3Bucket.Arn}/*
+
+Outputs:
+  ALBDNSName:
+    Description: 'DNS name of the ALB'
+    Value: !GetAtt ALB.DNSName
+    Export:
+      Name: !Sub ${EnvironmentName}-ALBDNSName
+
+  ECSClusterName:
+    Description: 'Name of the ECS Cluster'
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub ${EnvironmentName}-ECSClusterName
+
+  S3BucketName:
+    Description: 'Name of the S3 bucket for images'
+    Value: !Ref S3Bucket
+    Export:
+      Name: !Sub ${EnvironmentName}-S3BucketName
